@@ -104,7 +104,8 @@ export function Chat() {
     }));
 
     try {
-      const response = await fetch("/api/ollama/chat", {
+      const response = await fetch("http://127.0.0.1:8000/chat/stream", {
+        // const response = await fetch("/api/ollama/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -125,26 +126,35 @@ export function Chat() {
       }
 
       const decoder = new TextDecoder();
-      let buffer = "";
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
+        const chunkText = decoder.decode(value, { stream: true });
+        const lines = chunkText
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean);
 
         for (const line of lines) {
           if (!line.trim()) continue;
 
-          const chunk = JSON.parse(line) as {
-            message?: { content?: string };
-            done?: boolean;
-          };
+          const parsed = (() => {
+            try {
+              return JSON.parse(line) as {
+                message?: { content?: string; reasoning?: string; thinking?: string };
+                content?: string;
+                reasoning?: string;
+                thinking?: string;
+              };
+            } catch {
+              return { content: line };
+            }
+          })();
 
-          if (chunk.message?.content) {
-            const delta = chunk.message.content;
+          const delta = parsed.message?.content ?? parsed.content ?? line;
+          if (delta) {
             setMessages((prev) => {
               const updated = [...prev];
               const last = updated[updated.length - 1];

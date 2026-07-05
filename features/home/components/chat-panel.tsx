@@ -49,6 +49,61 @@ const defaultGenerationSettings: OllamaGenerationSettings = {
     seed: "",
 };
 
+function extractStreamDeltas(rawChunk: string) {
+    if (!rawChunk) {
+        return [] as Array<{ content: string; reasoning: string }>;
+    }
+
+    const lines = rawChunk
+        .split(/\r?\n/)
+        .filter((line) => line.length > 0);
+
+    if (lines.length === 0) {
+        return [] as Array<{ content: string; reasoning: string }>;
+    }
+
+    return lines.flatMap((line) => {
+        if (line.startsWith("data:")) {
+            const payload = line.replace(/^data:\s*/, "");
+            if (!payload || payload === "[DONE]") {
+                return [];
+            }
+
+            try {
+                const parsed = JSON.parse(payload) as {
+                    message?: { content?: string; reasoning?: string; thinking?: string };
+                    content?: string;
+                    reasoning?: string;
+                    thinking?: string;
+                };
+
+                return [{
+                    content: parsed.message?.content ?? parsed.content ?? "",
+                    reasoning: parsed.message?.reasoning ?? parsed.message?.thinking ?? parsed.reasoning ?? parsed.thinking ?? "",
+                }];
+            } catch {
+                return [{ content: payload, reasoning: "" }];
+            }
+        }
+
+        try {
+            const parsed = JSON.parse(line) as {
+                message?: { content?: string; reasoning?: string; thinking?: string };
+                content?: string;
+                reasoning?: string;
+                thinking?: string;
+            };
+
+            return [{
+                content: parsed.message?.content ?? parsed.content ?? "",
+                reasoning: parsed.message?.reasoning ?? parsed.message?.thinking ?? parsed.reasoning ?? parsed.thinking ?? "",
+            }];
+        } catch {
+            return [{ content: line, reasoning: "" }];
+        }
+    });
+}
+
 export function ChatPanel() {
     const [messages, setMessages] = useState<HomeChatMessage[]>([]);
     const [input, setInput] = useState("");
@@ -61,15 +116,10 @@ export function ChatPanel() {
     const { data, isLoading: modelsLoading, error: modelsError } = useGetModelsQuery();
 
     const availableModels = data?.models ?? [];
-    const modelsErrorMessage = modelsError
-        ? "Could not reach the local Ollama service."
+    const activeModel = selectedModel || availableModels[0]?.name || "fastapi";
+    const modelsStatusMessage = modelsError
+        ? "Model list is unavailable right now, so chat will continue with the FastAPI endpoint."
         : null;
-
-    useEffect(() => {
-        if (availableModels.length > 0 && !selectedModel) {
-            setSelectedModel(availableModels[0].name);
-        }
-    }, [availableModels, selectedModel]);
 
     useEffect(() => {
         bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -81,7 +131,7 @@ export function ChatPanel() {
 
     async function handleSend() {
         const content = input.trim();
-        if (!content || !selectedModel || isStreaming) {
+        if (!content || isStreaming) {
             return;
         }
 
@@ -99,7 +149,6 @@ export function ChatPanel() {
         };
 
         const pendingMessages = [...messages, userMessage];
-
         // Keep a placeholder assistant bubble so the UI updates immediately while the model is still thinking.
         setMessages([...pendingMessages, assistantPlaceholder]);
         setInput("");
@@ -111,23 +160,34 @@ export function ChatPanel() {
         let assistantMetrics: OllamaCompletionMetrics | undefined;
 
         try {
-            const response = await fetch("/api/ollama/chat", {
+            const response = await fetch("http://127.0.0.1:8000/chat/stream", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    model: selectedModel,
-                    messages: pendingMessages.map(({ role, content }) => ({ role, content })),
-                    stream: true,
-                    think: generationSettings.thinkingMode,
-                    options: {
-                        temperature: generationSettings.temperature,
-                        top_p: generationSettings.topP,
-                        top_k: generationSettings.topK,
-                        num_predict: generationSettings.maxOutputTokens,
-                        num_ctx: generationSettings.contextSize,
-                        seed: generationSettings.seed === "" ? undefined : Number(generationSettings.seed),
-                    },
-                }),
+                body: JSON.stringify(
+                    {
+                        "prompt": userMessage.content,
+                        "stream": true,
+                        // "system_prompt": "string",
+                        "use_rag": false,
+                        "documents": [
+                            // "string"
+                        ]
+                    }
+                    //     {
+                    //     model: selectedModel,
+                    //     messages: pendingMessages.map(({ role, content }) => ({ role, content })),
+                    //     stream: true,
+                    //     think: generationSettings.thinkingMode,
+                    //     options: {
+                    //         temperature: generationSettings.temperature,
+                    //         top_p: generationSettings.topP,
+                    //         top_k: generationSettings.topK,
+                    //         num_predict: generationSettings.maxOutputTokens,
+                    //         num_ctx: generationSettings.contextSize,
+                    //         seed: generationSettings.seed === "" ? undefined : Number(generationSettings.seed),
+                    //     },
+                    // }
+                ),
             });
 
             if (!response.ok) {
@@ -141,71 +201,23 @@ export function ChatPanel() {
 
             const reader = response.body.getReader();
             const decoder = new TextDecoder();
-            let buffer = "";
 
-            // Ollama streams NDJSON chunks, so we parse each line as it arrives and append any delta to the bubble.
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) {
                     break;
                 }
 
-                buffer += decoder.decode(value, { stream: true });
-                const lines = buffer.split("\n");
-                buffer = lines.pop() ?? "";
+                const chunkText = decoder.decode(value, { stream: true });
+                const deltas = extractStreamDeltas(chunkText);
 
-                for (const line of lines) {
-                    const trimmed = line.trim();
-                    if (!trimmed) {
-                        continue;
+                for (const delta of deltas) {
+                    if (delta.reasoning) {
+                        assistantReasoning += delta.reasoning;
                     }
 
-                    const chunk = JSON.parse(trimmed) as OllamaStreamChunk;
-
-                    const nextReasoning = chunk.message?.thinking ?? chunk.message?.reasoning ?? "";
-                    const nextContent = chunk.message?.content ?? "";
-
-                    if (nextReasoning) {
-                        assistantReasoning += nextReasoning;
-                    }
-
-                    if (nextContent) {
-                        assistantContent += nextContent;
-                    }
-
-                    if (chunk.done) {
-                        assistantMetrics = {
-                            totalDurationMs:
-                                typeof chunk.total_duration === "number"
-                                    ? Math.round(chunk.total_duration / 1_000_000)
-                                    : undefined,
-                            loadDurationMs:
-                                typeof chunk.load_duration === "number"
-                                    ? Math.round(chunk.load_duration / 1_000_000)
-                                    : undefined,
-                            promptEvalCount:
-                                typeof chunk.prompt_eval_count === "number"
-                                    ? chunk.prompt_eval_count
-                                    : undefined,
-                            promptEvalDurationMs:
-                                typeof chunk.prompt_eval_duration === "number"
-                                    ? Math.round(chunk.prompt_eval_duration / 1_000_000)
-                                    : undefined,
-                            evalCount:
-                                typeof chunk.eval_count === "number"
-                                    ? chunk.eval_count
-                                    : undefined,
-                            evalDurationMs:
-                                typeof chunk.eval_duration === "number"
-                                    ? Math.round(chunk.eval_duration / 1_000_000)
-                                    : undefined,
-                            tokensPerSecond:
-                                typeof chunk.eval_count === "number" &&
-                                    typeof chunk.eval_duration === "number"
-                                    ? Number((chunk.eval_count / (chunk.eval_duration / 1_000_000_000)).toFixed(1))
-                                    : undefined,
-                            doneReason: chunk.done_reason,
-                        };
+                    if (delta.content) {
+                        assistantContent += delta.content;
                     }
 
                     setMessages((prev) => {
@@ -223,6 +235,20 @@ export function ChatPanel() {
                         };
                         return updated;
                     });
+                }
+            }
+
+            const trailingChunk = decoder.decode();
+            if (trailingChunk) {
+                const trailingDeltas = extractStreamDeltas(trailingChunk);
+                for (const delta of trailingDeltas) {
+                    if (delta.reasoning) {
+                        assistantReasoning += delta.reasoning;
+                    }
+
+                    if (delta.content) {
+                        assistantContent += delta.content;
+                    }
                 }
             }
 
@@ -288,7 +314,7 @@ export function ChatPanel() {
                                 Loading models…
                             </div>
                         ) : availableModels.length > 0 ? (
-                            <Select value={selectedModel} onValueChange={setSelectedModel}>
+                            <Select value={activeModel} onValueChange={setSelectedModel}>
                                 <SelectTrigger className="w-[180px]">
                                     <SelectValue placeholder="Select model" />
                                 </SelectTrigger>
@@ -440,10 +466,10 @@ export function ChatPanel() {
                     </div>
                 </header>
 
-                {(error ?? modelsErrorMessage) && (
+                {(error ?? modelsStatusMessage) && (
                     <div className="flex shrink-0 items-center gap-2 border-b border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-300">
                         <AlertCircleIcon className="size-4 shrink-0" />
-                        <span>{error ?? modelsErrorMessage}</span>
+                        <span>{error ?? modelsStatusMessage}</span>
                     </div>
                 )}
 
@@ -460,7 +486,7 @@ export function ChatPanel() {
                                     </p>
                                     <p className="max-w-sm text-sm text-zinc-500 dark:text-zinc-400">
                                         {availableModels.length > 0
-                                            ? `Chat with ${selectedModel || "your model"} running locally via Ollama.`
+                                            ? `Chat with ${activeModel || "your model"} running locally via Ollama.`
                                             : "Pull a model with ollama pull llama3.2 then refresh."}
                                     </p>
                                 </div>
@@ -488,7 +514,7 @@ export function ChatPanel() {
                     value={input}
                     onChange={setInput}
                     onSubmit={handleSend}
-                    disabled={isStreaming || modelsLoading || !selectedModel || availableModels.length === 0}
+                    disabled={isStreaming || modelsLoading}
                 />
             </div>
         </TooltipProvider>
